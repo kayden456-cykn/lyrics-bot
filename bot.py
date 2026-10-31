@@ -76,31 +76,41 @@ async def play(interaction: discord.Interaction, audio: discord.Attachment):
             stems.mkdir()
             source.write_bytes(await audio.read())
 
-            await interaction.followup.send("Separating vocals now. This can take a few minutes on Railway.")
+            await interaction.followup.send(
+                "Separating vocals now. This can take a few minutes on Railway."
+            )
             await asyncio.to_thread(separate_vocals, source, stems)
             vocal_file = stems / "htdemucs" / source.stem / "vocals.wav"
 
             if voice_client.is_playing():
                 voice_client.stop()
-            done = asyncio.get_running_loop().create_future()
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
 
             def after_playback(error):
-                if not done.done():
+                def finish():
+                    if done.done():
+                        return
                     if error:
                         done.set_exception(error)
                     else:
                         done.set_result(None)
+                loop.call_soon_threadsafe(finish)
 
             audio_source = discord.FFmpegPCMAudio(str(vocal_file))
             voice_client.play(audio_source, after=after_playback)
-            await interaction.followup.send("Playing the isolated vocals in your voice channel")
-            # Keep the temporary audio alive until playback finishes.
+            await interaction.followup.send(
+                "Playing the isolated vocals in your voice channel"
+            )
+            # Keep temporary files available until playback completes.
             try:
                 await done
             finally:
                 audio_source.cleanup()
     except Exception as exc:
-        await interaction.followup.send(f"Could not process or play that audio: {type(exc).__name__}")
+        await interaction.followup.send(
+            f"Could not process or play that audio: {type(exc).__name__}"
+        )
 
 
 @bot.tree.command(name="stop", description="Stop vocal playback")
