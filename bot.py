@@ -14,6 +14,21 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+async def connect_to_member_channel(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        raise ValueError("Use this command in a server")
+    state = interaction.user.voice
+    if not state or not state.channel:
+        raise ValueError("Join a voice channel first")
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        if vc.channel != state.channel:
+            await vc.move_to(state.channel)
+    else:
+        vc = await state.channel.connect()
+    return vc
+
+
 def separate_vocals(source: Path, output_dir: Path) -> Path:
     """Run Demucs locally and return the isolated vocal stem."""
     import subprocess
@@ -44,15 +59,26 @@ async def on_ready():
         print(f"Slash command sync failed: {exc}")
 
 
+@bot.tree.command(name="join", description="Join your current voice channel")
+async def join(interaction: discord.Interaction):
+    try:
+        await connect_to_member_channel(interaction)
+        await interaction.response.send_message("Joined your voice channel")
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+    except Exception as exc:
+        await interaction.response.send_message(
+            f"Could not join voice: {type(exc).__name__}", ephemeral=True
+        )
+
+
 @bot.tree.command(name="play", description="Separate and play vocals from an audio file")
 @app_commands.describe(audio="Upload an audio file you have permission to use")
 async def play(interaction: discord.Interaction, audio: discord.Attachment):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Use this command in a server", ephemeral=True)
         return
-
-    voice_state = interaction.user.voice
-    if not voice_state or not voice_state.channel:
+    if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("Join a voice channel first", ephemeral=True)
         return
     if audio.size > MAX_UPLOAD_BYTES:
@@ -60,14 +86,8 @@ async def play(interaction: discord.Interaction, audio: discord.Attachment):
         return
 
     await interaction.response.defer(thinking=True)
-    voice_client = interaction.guild.voice_client
     try:
-        if voice_client and voice_client.is_connected():
-            if voice_client.channel != voice_state.channel:
-                await voice_client.move_to(voice_state.channel)
-        else:
-            voice_client = await voice_state.channel.connect()
-
+        voice_client = await connect_to_member_channel(interaction)
         suffix = Path(audio.filename).suffix or ".audio"
         with tempfile.TemporaryDirectory(prefix="vocalbot-") as temp:
             root = Path(temp)
@@ -99,10 +119,7 @@ async def play(interaction: discord.Interaction, audio: discord.Attachment):
 
             audio_source = discord.FFmpegPCMAudio(str(vocal_file))
             voice_client.play(audio_source, after=after_playback)
-            await interaction.followup.send(
-                "Playing the isolated vocals in your voice channel"
-            )
-            # Keep temporary files available until playback completes.
+            await interaction.followup.send("Playing the isolated vocals in your voice channel")
             try:
                 await done
             finally:
