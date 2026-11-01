@@ -13,6 +13,58 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Railway health endpoint. Railway provides PORT when a public domain is enabled.
+HTTP_SERVER = None
+
+
+async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        request = await asyncio.wait_for(reader.readline(), timeout=5)
+        parts = request.decode("latin-1", errors="replace").strip().split()
+        path = parts[1] if len(parts) >= 2 else "/"
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+        if path in ("/", "/health", "/healthz"):
+            status = "200 OK"
+            body = b"Toga Lyric is online"
+        else:
+            status = "404 Not Found"
+            body = b"Not found"
+
+        response = (
+            f"HTTP/1.1 {status}\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        writer.write(response)
+        await writer.drain()
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+
+
+async def start_health_server():
+    global HTTP_SERVER
+    if HTTP_SERVER is not None:
+        return
+
+    port = int(os.getenv("PORT", "8080"))
+    HTTP_SERVER = await asyncio.start_server(
+        handle_http_request,
+        host="0.0.0.0",
+        port=port,
+    )
+    print(f"HTTP health server listening on 0.0.0.0:{port}")
+
 
 async def connect_to_member_channel(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -52,6 +104,7 @@ def separate_vocals(source: Path, output_dir: Path) -> Path:
 
 @bot.event
 async def on_ready():
+    await start_health_server()
     try:
         synced = await bot.tree.sync()
         print(f"Logged in as {bot.user}; synced {len(synced)} slash commands")
