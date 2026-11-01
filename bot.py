@@ -13,35 +13,158 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Railway health endpoint. Railway provides PORT when a public domain is enabled.
+# Railway HTTP server and Discord OAuth2 login.
+import html
+import secrets
+import time
+from urllib.parse import parse_qs, urlencode, urlsplit
+
 HTTP_SERVER = None
+OAUTH_STATES = {}
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1566050081801633833")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_REDIRECT_URI = os.getenv(
+    "DISCORD_REDIRECT_URI",
+    "https://toga-lyric-production.up.railway.app/discord/callback",
+)
+
+
+async def send_http_response(writer, status, body, content_type="text/html; charset=utf-8", headers=None):
+    body = body.encode("utf-8") if isinstance(body, str) else body
+    response_headers = {
+        "Content-Type": content_type,
+        "Content-Length": str(len(body)),
+        "Connection": "close",
+        **(headers or {}),
+    }
+    head = f"HTTP/1.1 {status}\r\n" + "".join(
+        f"{key}: {value}\r\n" for key, value in response_headers.items()
+    ) + "\r\n"
+    writer.write(head.encode("latin-1") + body)
+    await writer.drain()
+
+
+async def handle_oauth_request(path, writer):
+    if path == "/":
+        await send_http_response(
+            writer,
+            "200 OK",
+            '<!doctype html><html><head><title>Toga Lyric</title></head>'
+            '<body><h1>Toga Lyric</h1><p>Discord voice bot is online.</p>'
+            '<a href="/login">Login with Discord</a></body></html>',
+        )
+        return
+
+    if path == "/health" or path == "/healthz":
+        await send_http_response(writer, "200 OK", "Toga Lyric is online", "text/plain; charset=utf-8")
+        return
+
+    if path == "/login":
+        if not DISCORD_CLIENT_ID:
+            await send_http_response(writer, "500 Internal Server Error", "Missing DISCORD_CLIENT_ID")
+            return
+        state = secrets.token_urlsafe(32)
+        OAUTH_STATES[state] = time.time() + 600
+        # Prune expired states so the in-memory state table stays small.
+        now = time.time()
+        for old_state, expires in list(OAUTH_STATES.items()):
+            if expires < now:
+                OAUTH_STATES.pop(old_state, None)
+        query = urlencode({
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+            "response_type": "code",
+            "scope": "identify",
+            "state": state,
+        })
+        await send_http_response(
+            writer,
+            "302 Found",
+            "",
+            headers={"Location": f"https://discord.com/oauth2/authorize?{query}"},
+        )
+        return
+
+    if path == "/discord/callback":
+        if not DISCORD_CLIENT_SECRET:
+            await send_http_response(
+                writer,
+                "500 Internal Server Error",
+                "Toga Lyric is missing the DISCORD_CLIENT_SECRET Railway variable.",
+            )
+            return
+        query = parse_qs(urlsplit(path).query)
+        # The query string is parsed by the caller and passed separately below.
+        await send_http_response(writer, "400 Bad Request", "Missing OAuth callback parameters.")
+        return
+
+    await send_http_response(writer, "404 Not Found", "Not found", "text/plain; charset=utf-8")
 
 
 async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         request = await asyncio.wait_for(reader.readline(), timeout=5)
         parts = request.decode("latin-1", errors="replace").strip().split()
-        path = parts[1] if len(parts) >= 2 else "/"
+        target = parts[1] if len(parts) >= 2 else "/"
+        parsed = urlsplit(target)
+        # Consume request headers before responding.
         while True:
             line = await asyncio.wait_for(reader.readline(), timeout=5)
             if line in (b"\r\n", b"\n", b""):
                 break
 
-        if path in ("/", "/health", "/healthz"):
-            status = "200 OK"
-            body = b"Toga Lyric is online"
-        else:
-            status = "404 Not Found"
-            body = b"Not found"
+        if parsed.path == "/discord/callback":
+            params = parse_qs(parsed.query)
+            error = params.get("error", [None])[0]
+            code = params.get("code", [None])[0]
+            state = params.get("state", [None])[0]
+            expires = OAUTH_STATES.pop(state, None) if state else None
 
-        response = (
-            f"HTTP/1.1 {status}\r\n"
-            "Content-Type: text/plain; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("ascii") + body
-        writer.write(response)
-        await writer.drain()
+            if error:
+                await send_http_response(writer, "400 Bad Request", f"Discord authorization failed: {html.escape(error)}")
+            elif not code or not expires or expires < time.time():
+                await send_http_response(writer, "400 Bad Request", "Invalid or expired login state. Please start again at /login.")
+            elif not DISCORD_CLIENT_SECRET:
+                await send_http_response(writer, "500 Internal Server Error", "Missing DISCORD_CLIENT_SECRET Railway variable.")
+            else:
+                import aiohttp
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            "https://discord.com/api/oauth2/token",
+                            data={
+                                "client_id": DISCORD_CLIENT_ID,
+                                "client_secret": DISCORD_CLIENT_SECRET,
+                                "grant_type": "authorization_code",
+                                "code": code,
+                                "redirect_uri": DISCORD_REDIRECT_URI,
+                            },
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        ) as token_response:
+                            token_data = await token_response.json()
+                        if token_response.status != 200:
+                            raise ValueError(token_data.get("error_description", "Discord token exchange failed"))
+                        async with session.get(
+                            "https://discord.com/api/users/@me",
+                            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+                        ) as user_response:
+                            user_data = await user_response.json()
+                        if user_response.status != 200:
+                            raise ValueError("Could not retrieve the Discord account")
+                    username = html.escape(user_data.get("global_name") or user_data.get("username") or "Discord user")
+                    user_id = html.escape(str(user_data.get("id", "")))
+                    await send_http_response(
+                        writer,
+                        "200 OK",
+                        f"<!doctype html><html><head><title>Discord login</title></head>"
+                        f"<body><h1>Discord login successful</h1><p>Signed in as {username}</p>"
+                        f"<p>Discord user ID: {user_id}</p></body></html>",
+                    )
+                except Exception as exc:
+                    print(f"Discord OAuth callback failed: {type(exc).__name__}: {exc}")
+                    await send_http_response(writer, "502 Bad Gateway", "Discord login failed. Check Railway logs and OAuth settings.")
+        else:
+            await handle_oauth_request(parsed.path, writer)
     except (asyncio.TimeoutError, ConnectionError, OSError):
         pass
     finally:
@@ -56,15 +179,13 @@ async def start_health_server():
     global HTTP_SERVER
     if HTTP_SERVER is not None:
         return
-
     port = int(os.getenv("PORT", "8080"))
     HTTP_SERVER = await asyncio.start_server(
         handle_http_request,
         host="0.0.0.0",
         port=port,
     )
-    print(f"HTTP health server listening on 0.0.0.0:{port}")
-
+    print(f"HTTP server listening on 0.0.0.0:{port}; OAuth callback: {DISCORD_REDIRECT_URI}")
 
 async def connect_to_member_channel(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
