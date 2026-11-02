@@ -23,10 +23,11 @@ HTTP_SERVER = None
 OAUTH_STATES = {}
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1566050081801633833")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = os.getenv(
-    "DISCORD_REDIRECT_URI",
-    "https://toga-lyric-production.up.railway.app/discord/callback",
-)
+DISCORD_REDIRECT_URI = (
+    os.getenv("DISCORD_REDIRECT_URI")
+    or os.getenv("DISCORD_REDIRECT_URL")
+    or "https://toga-lyric-production.up.railway.app/discord/callback"
+).strip()
 
 
 async def send_http_response(writer, status, body, content_type="text/html; charset=utf-8", headers=None):
