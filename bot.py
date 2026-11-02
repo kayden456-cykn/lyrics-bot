@@ -150,6 +150,20 @@ class InboxView(discord.ui.View):
         self.add_item(InboxSelect(owner_id, conversations))
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    print(f"Slash command error in {getattr(interaction.command, 'name', 'unknown')}: {type(original).__name__}: {original}", flush=True)
+    try:
+        message = "The command hit an error. Check the bot logs for details."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 @bot.event
 async def on_ready():
     try:
@@ -262,13 +276,14 @@ async def dm(interaction: discord.Interaction, user_id: str, message: str):
 
 @bot.tree.command(name="inbox", description="View your anonymous conversations")
 async def inbox(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     with db() as con:
         conversations = con.execute(
             "SELECT * FROM conversations WHERE owner_id=? ORDER BY updated_at DESC LIMIT 25",
             (str(interaction.user.id),)).fetchall()
 
     if not conversations:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Your anonymous inbox is empty. Use /dm to start a conversation.", ephemeral=True)
         return
 
@@ -282,17 +297,18 @@ async def inbox(interaction: discord.Interaction):
             value="ID: " + row["id"] + " • Updated: " + row["updated_at"][:16],
             inline=False)
     embed.set_footer(text="Only you can see this inbox")
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=embed, view=InboxView(interaction.user.id, conversations), ephemeral=True)
 
 
 @bot.tree.command(name="dmclose", description="Close one of your anonymous conversations")
 @app_commands.describe(conversation_id="The ID shown in your conversation dashboard")
 async def dmclose(interaction: discord.Interaction, conversation_id: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     conversation_id = conversation_id.strip().upper()
     conversation = get_conversation(conversation_id, interaction.user.id)
     if not conversation:
-        await interaction.response.send_message("Conversation not found in your inbox.", ephemeral=True)
+        await interaction.followup.send("Conversation not found in your inbox.", ephemeral=True)
         return
 
     with db() as con:
@@ -300,7 +316,7 @@ async def dmclose(interaction: discord.Interaction, conversation_id: str):
             "UPDATE conversations SET status='closed', updated_at=? WHERE id=? AND owner_id=?",
             (now(), conversation_id, str(interaction.user.id)))
     updated = get_conversation(conversation_id, interaction.user.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Conversation closed.", embed=dashboard_embed(updated), ephemeral=True)
 
 
