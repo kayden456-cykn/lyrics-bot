@@ -137,7 +137,8 @@ class InboxSelect(discord.ui.Select):
         await interaction.response.send_message(
             embed=dashboard_embed(conversation),
             view=ConversationDashboard(self.owner_id, conversation["id"]),
-            ephemeral=True)        try:
+            ephemeral=True)
+        try:
             LIVE_DASHBOARDS[conversation["id"]] = await interaction.original_response()
         except discord.HTTPException:
             pass
