@@ -220,17 +220,29 @@ def separate_vocals(source: Path, output_dir: Path) -> Path:
     """Run Demucs locally and return the isolated vocal stem."""
     import subprocess
 
-    subprocess.run(
+    result = subprocess.run(
         [
             "python", "-m", "demucs",
             "--name", "htdemucs",
             "--two-stems", "vocals",
+            "--shifts", "0",
+            "--overlap", "0.1",
+            "--segment", "5",
+            "--device", "cpu",
             "--out", str(output_dir),
             str(source),
         ],
-        check=True,
+        capture_output=True,
+        text=True,
         timeout=900,
     )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "No diagnostic output").strip()
+        print(f"Demucs failed with exit code {result.returncode}: {details[-5000:]}")
+        raise RuntimeError(
+            f"Vocal separation failed (exit {result.returncode}). "
+            "Check Railway logs for the Demucs error."
+        )
     vocal_path = output_dir / "htdemucs" / source.stem / "vocals.wav"
     if not vocal_path.is_file():
         raise FileNotFoundError("Demucs did not create the vocals stem")
