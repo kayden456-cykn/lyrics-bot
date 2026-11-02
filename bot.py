@@ -123,6 +123,19 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
 
             if error:
                 await send_http_response(writer, "400 Bad Request", f"Discord authorization failed: {html.escape(error)}")
+            elif code and params.get("guild_id", [None])[0] and not state:
+                # Discord bot-install authorization returns guild_id/permissions and
+                # does not use the dashboard's CSRF state. The bot is installed by
+                # Discord before this redirect; do not exchange this code as a user login.
+                guild_id = html.escape(params.get("guild_id", [""])[0])
+                await send_http_response(
+                    writer,
+                    "200 OK",
+                    "<!doctype html><html><head><title>Toga Lyric</title></head>"
+                    "<body><h1>Bot authorization completed</h1>"
+                    f"<p>Toga Lyric was authorized for server {guild_id}.</p>"
+                    "<p>You can return to Discord now.</p></body></html>",
+                )
             elif not code or not expires or expires < time.time():
                 await send_http_response(writer, "400 Bad Request", "Invalid or expired login state. Please start again at /login.")
             elif not DISCORD_CLIENT_SECRET:
