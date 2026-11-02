@@ -1,24 +1,31 @@
-# Vocal-only Discord Bot
+# anonymous user
 
-A Discord bot that separates the vocal stem from an audio file using Demucs and plays that stem in a server voice channel. Designed for Railway deployment.
+A Discord bot for anonymous two-way DMs with private conversation dashboards.
 
 ## Commands
 
-- `/play audio:<file>` — upload an audio file you have permission to use; the bot separates and plays its vocals.
-- `/stop` — stop playback.
-- `/leave` — disconnect from voice.
+- \`/dm user_id message\` — send an anonymous message and open a private dashboard.
+- \`/inbox\` — browse conversations and open a private dashboard.
+- \`/dmclose conversation_id\` — close a conversation.
 
-## Railway deployment
+## Replies
 
-1. Push this repository to GitHub and create a Railway service from the repository.
-2. Railway detects the `Dockerfile` and builds the image.
-3. Add the `DISCORD_TOKEN` environment variable in Railway.
-4. Deploy the service. No web server or port is required for this worker.
-5. Invite the Discord application with bot and application-command scopes, plus Connect, Speak, and Use Voice Activity permissions.
+The recipient replies directly to the bot's DM. Replies are stored and visible only to the person who started the conversation inside their private ephemeral dashboard. Use **Refresh** or \`/inbox\` to check for new replies. Replies are not forwarded to the sender's DMs.
 
-## Notes
+The recipient sees the bot account as the sender, not the initiating user's Discord account. Delivery can fail if the recipient has DMs disabled or Discord blocks the DM.
 
-- The bot currently accepts audio uploads, not YouTube URLs. Only upload audio you own or have permission to process.
-- Demucs is computationally intensive. Vocal separation may take several minutes and can require substantial RAM/CPU; Railway resource limits may affect performance.
-- Discord voice requires outbound UDP connectivity. Confirm voice networking is available in your Railway deployment region.
-- The bot uses temporary files and deletes them after playback completes.
+## Setup
+
+1. Create a Discord application and bot named **anonymous user** in the Discord Developer Portal.
+2. Enable the Message Content Intent.
+3. Invite it with the \`bot\` and \`applications.commands\` scopes and permission to send messages and embeds in DMs.
+4. Set \`DISCORD_TOKEN\` in Railway.
+5. Deploy this repository using the included Dockerfile.
+
+## Storage
+
+Conversation data is stored in SQLite. Set \`DATABASE_PATH\` to a path on a mounted Railway volume (for example \`/data/anonymous_user.sqlite3\`) to keep conversations across redeploys. Without a persistent volume, local SQLite data can be lost when Railway replaces the container.
+
+## Safety
+
+Use this bot only for consensual, non-harassing communication. Recipients can block the bot through Discord's privacy controls. The bot does not reveal the sender's Discord account to the recipient, but Discord and server administrators can still identify the bot account.
