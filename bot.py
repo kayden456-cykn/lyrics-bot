@@ -2,6 +2,8 @@ import os
 
 import asyncio
 import html
+import hashlib
+import hmac
 import secrets
 import time
 from urllib.parse import urlencode
@@ -16,8 +18,37 @@ DISCORD_REDIRECT_URI = (
     or os.getenv("DISCORD_REDIRECT_URI")
     or "https://toga-lyric-production.up.railway.app/discord/callback"
 )
-OAUTH_STATES = {}
 HTTP_RUNNER = None
+
+def make_oauth_state():
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(32)
+    payload = f"{timestamp}.{nonce}"
+    signature = hmac.new(
+        DISCORD_CLIENT_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}"
+
+def valid_oauth_state(state):
+    if not state or not DISCORD_CLIENT_SECRET:
+        return False
+    try:
+        timestamp, nonce, signature = state.split(".", 2)
+        issued_at = int(timestamp)
+    except (ValueError, TypeError):
+        return False
+    age = time.time() - issued_at
+    if age < 0 or age > 600:
+        return False
+    payload = f"{timestamp}.{nonce}"
+    expected = hmac.new(
+        DISCORD_CLIENT_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
 import sqlite3
 import time
 import uuid
@@ -191,11 +222,9 @@ async def oauth_home(request):
 
 
 async def oauth_login(request):
-    state = secrets.token_urlsafe(32)
-    OAUTH_STATES[state] = time.time() + 600
-    for key, expiry in list(OAUTH_STATES.items()):
-        if expiry < time.time():
-            OAUTH_STATES.pop(key, None)
+    if not DISCORD_CLIENT_SECRET:
+        return web.Response(text="Missing DISCORD_CLIENT_SECRET on Railway.", status=500)
+    state = make_oauth_state()
     query = urlencode({
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -213,8 +242,7 @@ async def oauth_callback(request):
         return web.Response(text="Discord authorization was cancelled.", status=400)
     code = request.query.get("code")
     state = request.query.get("state")
-    expiry = OAUTH_STATES.pop(state, None) if state else None
-    if not code or not expiry or expiry < time.time():
+    if not code or not valid_oauth_state(state):
         return web.Response(text="Login expired or invalid. Start again at /login.", status=400)
     try:
         async with aiohttp.ClientSession() as session:
