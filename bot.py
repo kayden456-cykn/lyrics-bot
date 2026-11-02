@@ -223,11 +223,10 @@ def separate_vocals(source: Path, output_dir: Path) -> Path:
     result = subprocess.run(
         [
             "python", "-m", "demucs",
-            "--name", "htdemucs",
+            "--name", "mdx_q",
             "--two-stems", "vocals",
             "--shifts", "0",
             "--overlap", "0.1",
-            "--segment", "5",
             "--device", "cpu",
             "--out", str(output_dir),
             str(source),
@@ -243,7 +242,7 @@ def separate_vocals(source: Path, output_dir: Path) -> Path:
             f"Vocal separation failed (exit {result.returncode}). "
             "Check Railway logs for the Demucs error."
         )
-    vocal_path = output_dir / "htdemucs" / source.stem / "vocals.wav"
+    vocal_path = output_dir / "mdx_q" / source.stem / "vocals.wav"
     if not vocal_path.is_file():
         raise FileNotFoundError("Demucs did not create the vocals stem")
     return vocal_path
@@ -300,7 +299,7 @@ async def play(interaction: discord.Interaction, audio: discord.Attachment):
                 "Separating vocals now. This can take a few minutes on Railway."
             )
             await asyncio.to_thread(separate_vocals, source, stems)
-            vocal_file = stems / "htdemucs" / source.stem / "vocals.wav"
+            vocal_file = stems / "mdx_q" / source.stem / "vocals.wav"
 
             if voice_client.is_playing():
                 voice_client.stop()
