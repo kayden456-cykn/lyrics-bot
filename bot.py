@@ -183,8 +183,92 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 
+async def oauth_home(request):
+    return web.Response(
+        text='<h1>Toga Productions</h1><p>Connect your Discord account to continue.</p><a href="/login">Continue with Discord</a>',
+        content_type="text/html",
+    )
+
+
+async def oauth_login(request):
+    state = secrets.token_urlsafe(32)
+    OAUTH_STATES[state] = time.time() + 600
+    for key, expiry in list(OAUTH_STATES.items()):
+        if expiry < time.time():
+            OAUTH_STATES.pop(key, None)
+    query = urlencode({
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify",
+        "state": state,
+    })
+    raise web.HTTPFound("https://discord.com/oauth2/authorize?" + query)
+
+
+async def oauth_callback(request):
+    if not DISCORD_CLIENT_SECRET:
+        return web.Response(text="Missing DISCORD_CLIENT_SECRET on Railway.", status=500)
+    if request.query.get("error"):
+        return web.Response(text="Discord authorization was cancelled.", status=400)
+    code = request.query.get("code")
+    state = request.query.get("state")
+    expiry = OAUTH_STATES.pop(state, None) if state else None
+    if not code or not expiry or expiry < time.time():
+        return web.Response(text="Login expired or invalid. Start again at /login.", status=400)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": DISCORD_CLIENT_ID,
+                    "client_secret": DISCORD_CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": DISCORD_REDIRECT_URI,
+                },
+            ) as response:
+                token_data = await response.json()
+                if response.status != 200:
+                    print(f"OAuth token exchange failed: {response.status} {token_data}", flush=True)
+                    return web.Response(text="Discord token exchange failed. Check OAuth settings.", status=502)
+            async with session.get(
+                "https://discord.com/api/users/@me",
+                headers={"Authorization": "Bearer " + token_data["access_token"]},
+            ) as response:
+                user_data = await response.json()
+                if response.status != 200:
+                    return web.Response(text="Could not verify the Discord account.", status=502)
+        username = html.escape(user_data.get("global_name") or user_data.get("username") or "Discord user")
+        user_id = html.escape(str(user_data.get("id", "")))
+        return web.Response(
+            text=f"<h1>Discord login successful</h1><p>Signed in as {username}</p><p>Account ID: {user_id}</p>",
+            content_type="text/html",
+        )
+    except Exception as exc:
+        print(f"OAuth callback failed: {type(exc).__name__}: {exc}", flush=True)
+        return web.Response(text="Discord login failed. Check Railway logs.", status=502)
+
+
+async def start_oauth_server():
+    global HTTP_RUNNER
+    if HTTP_RUNNER is not None:
+        return
+    app = web.Application()
+    app.router.add_get("/", oauth_home)
+    app.router.add_get("/login", oauth_login)
+    app.router.add_get("/discord/callback", oauth_callback)
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
+    HTTP_RUNNER = web.AppRunner(app)
+    await HTTP_RUNNER.setup()
+    site = web.TCPSite(HTTP_RUNNER, "0.0.0.0", int(os.getenv("PORT", "8080")))
+    await site.start()
+    print(f"OAuth server listening; callback={DISCORD_REDIRECT_URI}", flush=True)
+
+
 @bot.event
 async def on_ready():
+    await start_oauth_server()
     try:
         synced = await bot.tree.sync()
         print(f"Logged in as {bot.user}; synced {len(synced)} slash commands")
