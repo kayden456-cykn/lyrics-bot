@@ -11,6 +11,7 @@ from discord.ext import commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("DATABASE_PATH", "anonymous_user.sqlite3")
 SEND_COOLDOWNS = {}
+LIVE_DASHBOARDS = {}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -136,7 +137,10 @@ class InboxSelect(discord.ui.Select):
         await interaction.response.send_message(
             embed=dashboard_embed(conversation),
             view=ConversationDashboard(self.owner_id, conversation["id"]),
-            ephemeral=True)
+            ephemeral=True)        try:
+            LIVE_DASHBOARDS[conversation["id"]] = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
 
 class InboxView(discord.ui.View):
@@ -183,8 +187,15 @@ async def on_message(message):
         return
 
     add_message(conversation["id"], "recipient", content)
+    dashboard_message = LIVE_DASHBOARDS.get(conversation["id"])
+    if dashboard_message:
+        try:
+            updated_conversation = get_conversation(conversation["id"], conversation["owner_id"])
+            await dashboard_message.edit(embed=dashboard_embed(updated_conversation))
+        except (discord.NotFound, discord.HTTPException):
+            LIVE_DASHBOARDS.pop(conversation["id"], None)
     await message.channel.send(
-        "Your reply was saved privately. The sender can view it in their anonymous dashboard.")
+        "Your reply was saved privately. The sender dashboard updates automatically while active; otherwise use /inbox.")
 
 
 @bot.tree.command(name="dm", description="Send an anonymous DM and open its dashboard")
@@ -239,11 +250,13 @@ async def dm(interaction: discord.Interaction, user_id: str, message: str):
             (conversation_id, str(interaction.user.id), str(recipient_id), str(recipient), timestamp, timestamp))
     add_message(conversation_id, "owner", message.strip())
     conversation = get_conversation(conversation_id, interaction.user.id)
-    await interaction.followup.send(
+    dashboard_message = await interaction.followup.send(
         content="**Anonymous message sent.** This dashboard is only visible to you.",
         embed=dashboard_embed(conversation),
         view=ConversationDashboard(interaction.user.id, conversation_id),
-        ephemeral=True)
+        ephemeral=True,
+        wait=True)
+    LIVE_DASHBOARDS[conversation_id] = dashboard_message
 
 
 @bot.tree.command(name="inbox", description="View your anonymous conversations")
