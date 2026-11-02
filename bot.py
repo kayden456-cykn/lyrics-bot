@@ -1,4 +1,23 @@
 import os
+
+import asyncio
+import html
+import secrets
+import time
+from urllib.parse import urlencode
+
+import aiohttp
+from aiohttp import web
+
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1566050081801633833")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_REDIRECT_URI = (
+    os.getenv("DISCORD_REDIRECT_URL")
+    or os.getenv("DISCORD_REDIRECT_URI")
+    or "https://toga-lyric-production.up.railway.app/discord/callback"
+)
+OAUTH_STATES = {}
+HTTP_RUNNER = None
 import sqlite3
 import time
 import uuid
