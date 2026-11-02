@@ -317,6 +317,8 @@ async def on_message(message):
 
 
 @bot.tree.command(name="dm", description="Send an anonymous DM and open its dashboard")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(user_id="The recipient's Discord user ID", message="The anonymous message to send")
 async def dm(interaction: discord.Interaction, user_id: str, message: str):
     cooldown_key = str(interaction.user.id)
@@ -378,6 +380,8 @@ async def dm(interaction: discord.Interaction, user_id: str, message: str):
 
 
 @bot.tree.command(name="inbox", description="View your anonymous conversations")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def inbox(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     with db() as con:
@@ -405,6 +409,8 @@ async def inbox(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="dmclose", description="Close one of your anonymous conversations")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(conversation_id="The ID shown in your conversation dashboard")
 async def dmclose(interaction: discord.Interaction, conversation_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
