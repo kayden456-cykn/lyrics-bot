@@ -1,4 +1,1 @@
-discord.py[voice]>=2.4,<3
-demucs>=4.0,<5
-diffq>=0.2.4,<0.3
-numpy>=1.23,<2
+discord.py>=2.4,<3
