@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -9,6 +10,7 @@ from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("DATABASE_PATH", "anonymous_user.sqlite3")
+SEND_COOLDOWNS = {}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -169,6 +171,11 @@ async def on_message(message):
         return
 
     content = message.content.strip()
+    if content.lower() in {"stop", "unsubscribe", "cancel"}:
+        with db() as con:
+            con.execute("UPDATE conversations SET status='closed', updated_at=? WHERE id=?", (now(), conversation["id"]))
+        await message.channel.send("This anonymous conversation is now closed. You will not receive more messages from it.")
+        return
     if message.attachments:
         content = "\n".join([content] + [f"Attachment: {item.url}" for item in message.attachments]).strip()
     if not content:
@@ -183,6 +190,11 @@ async def on_message(message):
 @bot.tree.command(name="dm", description="Send an anonymous DM and open its dashboard")
 @app_commands.describe(user_id="The recipient's Discord user ID", message="The anonymous message to send")
 async def dm(interaction: discord.Interaction, user_id: str, message: str):
+    cooldown_key = str(interaction.user.id)
+    remaining = 30 - (time.time() - SEND_COOLDOWNS.get(cooldown_key, 0))
+    if remaining > 0:
+        await interaction.response.send_message(f"Please wait {int(remaining) + 1} seconds before sending another anonymous DM.", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         recipient_id = int(user_id.strip())
@@ -217,6 +229,7 @@ async def dm(interaction: discord.Interaction, user_id: str, message: str):
         await interaction.followup.send("Discord couldn't deliver that message. Try again later.", ephemeral=True)
         return
 
+    SEND_COOLDOWNS[cooldown_key] = time.time()
     timestamp = now()
     with db() as con:
         con.execute(
