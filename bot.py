@@ -217,35 +217,81 @@ async def connect_to_member_channel(interaction: discord.Interaction):
 
 
 def separate_vocals(source: Path, output_dir: Path) -> Path:
-    """Run Demucs locally and return the isolated vocal stem."""
+    """Separate 15-second chunks sequentially to keep peak RAM low."""
     import subprocess
 
-    result = subprocess.run(
+    chunks_dir = output_dir / "chunks"
+    demucs_dir = output_dir / "demucs"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    demucs_dir.mkdir(parents=True, exist_ok=True)
+
+    split = subprocess.run(
         [
-            "python", "-m", "demucs",
-            "--name", "mdx_q",
-            "--two-stems", "vocals",
-            "--shifts", "0",
-            "--overlap", "0.1",
-            "--device", "cpu",
-            "--out", str(output_dir),
-            str(source),
+            "ffmpeg", "-y", "-i", str(source),
+            "-vn", "-ac", "2", "-ar", "44100",
+            "-f", "segment", "-segment_time", "15",
+            "-reset_timestamps", "1",
+            str(chunks_dir / "chunk_%04d.wav"),
         ],
         capture_output=True,
         text=True,
-        timeout=900,
+        timeout=180,
     )
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "No diagnostic output").strip()
-        print(f"Demucs failed with exit code {result.returncode}: {details[-5000:]}")
-        raise RuntimeError(
-            f"Vocal separation failed (exit {result.returncode}). "
-            "Check Railway logs for the Demucs error."
+    if split.returncode != 0:
+        details = (split.stderr or split.stdout or "No diagnostic output").strip()
+        print(f"Audio chunking failed: {details[-3000:]}")
+        raise RuntimeError("Could not split audio into smaller chunks")
+
+    chunk_files = sorted(chunks_dir.glob("chunk_*.wav"))
+    if not chunk_files:
+        raise FileNotFoundError("FFmpeg did not create audio chunks")
+
+    vocal_files = []
+    for index, chunk in enumerate(chunk_files, start=1):
+        chunk_output = demucs_dir / chunk.stem
+        result = subprocess.run(
+            [
+                "python", "-m", "demucs",
+                "--name", "mdx_q",
+                "--two-stems", "vocals",
+                "--shifts", "0",
+                "--overlap", "0.1",
+                "--device", "cpu",
+                "--out", str(chunk_output),
+                str(chunk),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
         )
-    vocal_path = output_dir / "mdx_q" / source.stem / "vocals.wav"
-    if not vocal_path.is_file():
-        raise FileNotFoundError("Demucs did not create the vocals stem")
-    return vocal_path
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "No diagnostic output").strip()
+            print(f"Demucs chunk {index}/{len(chunk_files)} failed with exit code {result.returncode}: {details[-4000:]}")
+            raise RuntimeError(f"Vocal separation failed on chunk {index}")
+        vocal = chunk_output / "mdx_q" / chunk.stem / "vocals.wav"
+        if not vocal.is_file():
+            raise FileNotFoundError(f"Demucs did not create vocals for chunk {index}")
+        vocal_files.append(vocal)
+        print(f"Separated audio chunk {index}/{len(chunk_files)}")
+
+    concat_list = output_dir / "vocals_concat.txt"
+    concat_list.write_text(
+        "".join(f"file '{path.as_posix()}'\\n" for path in vocal_files),
+        encoding="utf-8",
+    )
+    merged = output_dir / "vocals.wav"
+    combine = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(merged)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if combine.returncode != 0:
+        details = (combine.stderr or combine.stdout or "No diagnostic output").strip()
+        print(f"Vocal chunk merge failed: {details[-3000:]}")
+        raise RuntimeError("Could not merge separated vocal chunks")
+    return merged
 
 
 @bot.event
@@ -298,8 +344,7 @@ async def play(interaction: discord.Interaction, audio: discord.Attachment):
             await interaction.followup.send(
                 "Separating vocals now. This can take a few minutes on Railway."
             )
-            await asyncio.to_thread(separate_vocals, source, stems)
-            vocal_file = stems / "mdx_q" / source.stem / "vocals.wav"
+            vocal_file = await asyncio.to_thread(separate_vocals, source, stems)
 
             if voice_client.is_playing():
                 voice_client.stop()
