@@ -1,400 +1,284 @@
-import asyncio
 import os
-import tempfile
-from pathlib import Path
+import sqlite3
+import uuid
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-
+DB_PATH = os.getenv("DATABASE_PATH", "anonymous_user.sqlite3")
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Railway HTTP server and Discord OAuth2 login.
-import html
-import secrets
-import time
-from urllib.parse import parse_qs, urlencode, urlsplit
 
-HTTP_SERVER = None
-OAUTH_STATES = {}
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1566050081801633833")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = (
-    os.getenv("DISCORD_REDIRECT_URI")
-    or os.getenv("DISCORD_REDIRECT_URL")
-    or "https://toga-lyric-production.up.railway.app/discord/callback"
-).strip()
+def db():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-async def send_http_response(writer, status, body, content_type="text/html; charset=utf-8", headers=None):
-    body = body.encode("utf-8") if isinstance(body, str) else body
-    response_headers = {
-        "Content-Type": content_type,
-        "Content-Length": str(len(body)),
-        "Connection": "close",
-        **(headers or {}),
-    }
-    head = f"HTTP/1.1 {status}\r\n" + "".join(
-        f"{key}: {value}\r\n" for key, value in response_headers.items()
-    ) + "\r\n"
-    writer.write(head.encode("latin-1") + body)
-    await writer.drain()
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def handle_oauth_request(path, writer):
-    if path == "/":
-        await send_http_response(
-            writer,
-            "200 OK",
-            '<!doctype html><html><head><title>Toga Lyric</title></head>'
-            '<body><h1>Toga Lyric</h1><p>Discord voice bot is online.</p>'
-            '<a href="/login">Login with Discord</a></body></html>',
-        )
-        return
-
-    if path == "/health" or path == "/healthz":
-        await send_http_response(writer, "200 OK", "Toga Lyric is online", "text/plain; charset=utf-8")
-        return
-
-    if path == "/login":
-        if not DISCORD_CLIENT_ID:
-            await send_http_response(writer, "500 Internal Server Error", "Missing DISCORD_CLIENT_ID")
-            return
-        state = secrets.token_urlsafe(32)
-        OAUTH_STATES[state] = time.time() + 600
-        # Prune expired states so the in-memory state table stays small.
-        now = time.time()
-        for old_state, expires in list(OAUTH_STATES.items()):
-            if expires < now:
-                OAUTH_STATES.pop(old_state, None)
-        query = urlencode({
-            "client_id": DISCORD_CLIENT_ID,
-            "redirect_uri": DISCORD_REDIRECT_URI,
-            "response_type": "code",
-            "scope": "identify",
-            "state": state,
-        })
-        await send_http_response(
-            writer,
-            "302 Found",
-            "",
-            headers={"Location": f"https://discord.com/oauth2/authorize?{query}"},
-        )
-        return
-
-    if path == "/discord/callback":
-        if not DISCORD_CLIENT_SECRET:
-            await send_http_response(
-                writer,
-                "500 Internal Server Error",
-                "Toga Lyric is missing the DISCORD_CLIENT_SECRET Railway variable.",
-            )
-            return
-        query = parse_qs(urlsplit(path).query)
-        # The query string is parsed by the caller and passed separately below.
-        await send_http_response(writer, "400 Bad Request", "Missing OAuth callback parameters.")
-        return
-
-    await send_http_response(writer, "404 Not Found", "Not found", "text/plain; charset=utf-8")
+def init_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, recipient_id TEXT NOT NULL,
+            recipient_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,
+            sender TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_owner ON conversations(owner_id, updated_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_recipient ON conversations(recipient_id, status, updated_at)")
 
 
-async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        request = await asyncio.wait_for(reader.readline(), timeout=5)
-        parts = request.decode("latin-1", errors="replace").strip().split()
-        target = parts[1] if len(parts) >= 2 else "/"
-        parsed = urlsplit(target)
-        # Consume request headers before responding.
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=5)
-            if line in (b"\r\n", b"\n", b""):
-                break
-
-        if parsed.path == "/discord/callback":
-            params = parse_qs(parsed.query)
-            error = params.get("error", [None])[0]
-            code = params.get("code", [None])[0]
-            state = params.get("state", [None])[0]
-            expires = OAUTH_STATES.pop(state, None) if state else None
-
-            if error:
-                await send_http_response(writer, "400 Bad Request", f"Discord authorization failed: {html.escape(error)}")
-            elif code and params.get("guild_id", [None])[0] and not state:
-                # Discord bot-install authorization returns guild_id/permissions and
-                # does not use the dashboard's CSRF state. The bot is installed by
-                # Discord before this redirect; do not exchange this code as a user login.
-                guild_id = html.escape(params.get("guild_id", [""])[0])
-                await send_http_response(
-                    writer,
-                    "200 OK",
-                    "<!doctype html><html><head><title>Toga Lyric</title></head>"
-                    "<body><h1>Bot authorization completed</h1>"
-                    f"<p>Toga Lyric was authorized for server {guild_id}.</p>"
-                    "<p>You can return to Discord now.</p></body></html>",
-                )
-            elif not code or not expires or expires < time.time():
-                await send_http_response(writer, "400 Bad Request", "Invalid or expired login state. Please start again at /login.")
-            elif not DISCORD_CLIENT_SECRET:
-                await send_http_response(writer, "500 Internal Server Error", "Missing DISCORD_CLIENT_SECRET Railway variable.")
-            else:
-                import aiohttp
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            "https://discord.com/api/oauth2/token",
-                            data={
-                                "client_id": DISCORD_CLIENT_ID,
-                                "client_secret": DISCORD_CLIENT_SECRET,
-                                "grant_type": "authorization_code",
-                                "code": code,
-                                "redirect_uri": DISCORD_REDIRECT_URI,
-                            },
-                            headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        ) as token_response:
-                            token_data = await token_response.json()
-                        if token_response.status != 200:
-                            raise ValueError(token_data.get("error_description", "Discord token exchange failed"))
-                        async with session.get(
-                            "https://discord.com/api/users/@me",
-                            headers={"Authorization": f"Bearer {token_data['access_token']}"},
-                        ) as user_response:
-                            user_data = await user_response.json()
-                        if user_response.status != 200:
-                            raise ValueError("Could not retrieve the Discord account")
-                    username = html.escape(user_data.get("global_name") or user_data.get("username") or "Discord user")
-                    user_id = html.escape(str(user_data.get("id", "")))
-                    await send_http_response(
-                        writer,
-                        "200 OK",
-                        f"<!doctype html><html><head><title>Discord login</title></head>"
-                        f"<body><h1>Discord login successful</h1><p>Signed in as {username}</p>"
-                        f"<p>Discord user ID: {user_id}</p></body></html>",
-                    )
-                except Exception as exc:
-                    print(f"Discord OAuth callback failed: {type(exc).__name__}: {exc}")
-                    await send_http_response(writer, "502 Bad Gateway", "Discord login failed. Check Railway logs and OAuth settings.")
-        else:
-            await handle_oauth_request(parsed.path, writer)
-    except (asyncio.TimeoutError, ConnectionError, OSError):
-        pass
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except OSError:
-            pass
+def add_message(conversation_id, sender, content):
+    timestamp = now()
+    with db() as con:
+        con.execute(
+            "INSERT INTO messages(conversation_id, sender, content, created_at) VALUES (?, ?, ?, ?)",
+            (conversation_id, sender, content[:4000], timestamp))
+        con.execute("UPDATE conversations SET updated_at=? WHERE id=?", (timestamp, conversation_id))
 
 
-async def start_health_server():
-    global HTTP_SERVER
-    if HTTP_SERVER is not None:
-        return
-    port = int(os.getenv("PORT", "8080"))
-    HTTP_SERVER = await asyncio.start_server(
-        handle_http_request,
-        host="0.0.0.0",
-        port=port,
-    )
-    print(f"HTTP server listening on 0.0.0.0:{port}; OAuth callback: {DISCORD_REDIRECT_URI}")
+def get_conversation(conversation_id, owner_id):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM conversations WHERE id=? AND owner_id=?",
+            (conversation_id, str(owner_id))).fetchone()
 
-async def connect_to_member_channel(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        raise ValueError("Use this command in a server")
-    state = interaction.user.voice
-    if not state or not state.channel:
-        raise ValueError("Join a voice channel first")
-    vc = interaction.guild.voice_client
-    if vc and vc.is_connected():
-        if vc.channel != state.channel:
-            await vc.move_to(state.channel)
+
+def get_messages(conversation_id):
+    with db() as con:
+        return con.execute(
+            "SELECT sender, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 12",
+            (conversation_id,)).fetchall()[::-1]
+
+
+def dashboard_embed(conversation):
+    embed = discord.Embed(
+        title="Anonymous User | Conversation",
+        description=(
+            f"**Recipient:** <@{conversation['recipient_id']}> ({conversation['recipient_id']})\n"
+            f"**Status:** {conversation['status'].title()}\n"
+            f"**Conversation ID:** {conversation['id']}"
+        ),
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc))
+    messages = get_messages(conversation["id"])
+    if messages:
+        lines = []
+        for item in messages:
+            label = "You" if item["sender"] == "owner" else "Recipient"
+            lines.append(f"**{label}:** {item['content'][:650]}")
+        embed.add_field(name="Messages", value="\n\n".join(lines)[:3900], inline=False)
     else:
-        vc = await state.channel.connect()
-    return vc
+        embed.add_field(name="Messages", value="No replies yet. Use Refresh to check again.", inline=False)
+    embed.set_footer(text="Only you can see this dashboard")
+    return embed
 
 
-def separate_vocals(source: Path, output_dir: Path) -> Path:
-    """Separate 15-second chunks sequentially to keep peak RAM low."""
-    import subprocess
+class ConversationDashboard(discord.ui.View):
+    def __init__(self, owner_id, conversation_id):
+        super().__init__(timeout=900)
+        self.owner_id = str(owner_id)
+        self.conversation_id = conversation_id
 
-    chunks_dir = output_dir / "chunks"
-    demucs_dir = output_dir / "demucs"
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-    demucs_dir.mkdir(parents=True, exist_ok=True)
+    async def interaction_check(self, interaction):
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("This dashboard belongs to someone else.", ephemeral=True)
+            return False
+        return True
 
-    split = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", str(source),
-            "-vn", "-ac", "2", "-ar", "44100",
-            "-f", "segment", "-segment_time", "15",
-            "-reset_timestamps", "1",
-            str(chunks_dir / "chunk_%04d.wav"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if split.returncode != 0:
-        details = (split.stderr or split.stdout or "No diagnostic output").strip()
-        print(f"Audio chunking failed: {details[-3000:]}")
-        raise RuntimeError("Could not split audio into smaller chunks")
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction, button):
+        conversation = get_conversation(self.conversation_id, self.owner_id)
+        if not conversation:
+            await interaction.response.send_message("Conversation not found.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=dashboard_embed(conversation), view=self)
 
-    chunk_files = sorted(chunks_dir.glob("chunk_*.wav"))
-    if not chunk_files:
-        raise FileNotFoundError("FFmpeg did not create audio chunks")
+    @discord.ui.button(label="Close conversation", style=discord.ButtonStyle.danger)
+    async def close(self, interaction, button):
+        with db() as con:
+            con.execute(
+                "UPDATE conversations SET status='closed', updated_at=? WHERE id=? AND owner_id=?",
+                (now(), self.conversation_id, self.owner_id))
+        conversation = get_conversation(self.conversation_id, self.owner_id)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=dashboard_embed(conversation), view=self)
 
-    vocal_files = []
-    for index, chunk in enumerate(chunk_files, start=1):
-        chunk_output = demucs_dir / chunk.stem
-        result = subprocess.run(
-            [
-                "python", "-m", "demucs",
-                "--name", "mdx_q",
-                "--two-stems", "vocals",
-                "--shifts", "0",
-                "--overlap", "0.1",
-                "--device", "cpu",
-                "--out", str(chunk_output),
-                str(chunk),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
-        )
-        if result.returncode != 0:
-            details = (result.stderr or result.stdout or "No diagnostic output").strip()
-            print(f"Demucs chunk {index}/{len(chunk_files)} failed with exit code {result.returncode}: {details[-4000:]}")
-            raise RuntimeError(f"Vocal separation failed on chunk {index}")
-        vocal = chunk_output / "mdx_q" / chunk.stem / "vocals.wav"
-        if not vocal.is_file():
-            raise FileNotFoundError(f"Demucs did not create vocals for chunk {index}")
-        vocal_files.append(vocal)
-        print(f"Separated audio chunk {index}/{len(chunk_files)}")
 
-    concat_list = output_dir / "vocals_concat.txt"
-    concat_list.write_text(
-        "".join(f"file '{path.as_posix()}'\\n" for path in vocal_files),
-        encoding="utf-8",
-    )
-    merged = output_dir / "vocals.wav"
-    combine = subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(merged)],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if combine.returncode != 0:
-        details = (combine.stderr or combine.stdout or "No diagnostic output").strip()
-        print(f"Vocal chunk merge failed: {details[-3000:]}")
-        raise RuntimeError("Could not merge separated vocal chunks")
-    return merged
+class InboxSelect(discord.ui.Select):
+    def __init__(self, owner_id, conversations):
+        self.owner_id = str(owner_id)
+        options = [
+            discord.SelectOption(
+                label=("To " + row["recipient_name"])[:100],
+                description=(row["status"].title() + " • " + row["updated_at"][:16]),
+                value=row["id"])
+            for row in conversations[:25]]
+        super().__init__(placeholder="Choose a conversation", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction):
+        conversation = get_conversation(self.values[0], self.owner_id)
+        if not conversation:
+            await interaction.response.send_message("Conversation not found.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=dashboard_embed(conversation),
+            view=ConversationDashboard(self.owner_id, conversation["id"]),
+            ephemeral=True)
+
+
+class InboxView(discord.ui.View):
+    def __init__(self, owner_id, conversations):
+        super().__init__(timeout=300)
+        self.add_item(InboxSelect(owner_id, conversations))
 
 
 @bot.event
 async def on_ready():
-    await start_health_server()
     try:
         synced = await bot.tree.sync()
         print(f"Logged in as {bot.user}; synced {len(synced)} slash commands")
     except Exception as exc:
-        print(f"Slash command sync failed: {exc}")
+        print(f"Slash command sync failed: {type(exc).__name__}: {exc}")
 
 
-@bot.tree.command(name="join", description="Join your current voice channel")
-async def join(interaction: discord.Interaction):
+@bot.event
+async def on_message(message):
+    if message.author.bot or message.guild is not None:
+        return
+
+    with db() as con:
+        conversation = con.execute(
+            """SELECT * FROM conversations
+               WHERE recipient_id=? AND status='open'
+               ORDER BY updated_at DESC LIMIT 1""",
+            (str(message.author.id),)).fetchone()
+
+    if not conversation:
+        await message.channel.send("There isn't an open anonymous conversation for you right now.")
+        return
+
+    content = message.content.strip()
+    if message.attachments:
+        content = "\n".join([content] + [f"Attachment: {item.url}" for item in message.attachments]).strip()
+    if not content:
+        await message.channel.send("Please send text or an attachment as your reply.")
+        return
+
+    add_message(conversation["id"], "recipient", content)
+    await message.channel.send(
+        "Your reply was saved privately. The sender can view it in their anonymous dashboard.")
+
+
+@bot.tree.command(name="dm", description="Send an anonymous DM and open its dashboard")
+@app_commands.describe(user_id="The recipient's Discord user ID", message="The anonymous message to send")
+async def dm(interaction: discord.Interaction, user_id: str, message: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        await connect_to_member_channel(interaction)
-        await interaction.response.send_message("Joined your voice channel")
-    except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
-    except Exception as exc:
-        await interaction.response.send_message(
-            f"Could not join voice: {type(exc).__name__}", ephemeral=True
-        )
-
-
-@bot.tree.command(name="play", description="Separate and play vocals from an audio file")
-@app_commands.describe(audio="Upload an audio file you have permission to use")
-async def play(interaction: discord.Interaction, audio: discord.Attachment):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Use this command in a server", ephemeral=True)
-        return
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("Join a voice channel first", ephemeral=True)
-        return
-    if audio.size > MAX_UPLOAD_BYTES:
-        await interaction.response.send_message("That file is too large (50 MB max)", ephemeral=True)
+        recipient_id = int(user_id.strip())
+        if recipient_id <= 0 or recipient_id == bot.user.id:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await interaction.followup.send("Enter a valid Discord user ID.", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
+    if recipient_id == interaction.user.id:
+        await interaction.followup.send("You cannot message yourself.", ephemeral=True)
+        return
+    if not message.strip():
+        await interaction.followup.send("Your message cannot be empty.", ephemeral=True)
+        return
+
     try:
-        voice_client = await connect_to_member_channel(interaction)
-        suffix = Path(audio.filename).suffix or ".audio"
-        with tempfile.TemporaryDirectory(prefix="vocalbot-") as temp:
-            root = Path(temp)
-            source = root / f"input{suffix}"
-            stems = root / "stems"
-            stems.mkdir()
-            source.write_bytes(await audio.read())
-
-            await interaction.followup.send(
-                "Separating vocals now. This can take a few minutes on Railway."
-            )
-            vocal_file = await asyncio.to_thread(separate_vocals, source, stems)
-
-            if voice_client.is_playing():
-                voice_client.stop()
-            loop = asyncio.get_running_loop()
-            done = loop.create_future()
-
-            def after_playback(error):
-                def finish():
-                    if done.done():
-                        return
-                    if error:
-                        done.set_exception(error)
-                    else:
-                        done.set_result(None)
-                loop.call_soon_threadsafe(finish)
-
-            audio_source = discord.FFmpegPCMAudio(str(vocal_file))
-            voice_client.play(audio_source, after=after_playback)
-            await interaction.followup.send("Playing the isolated vocals in your voice channel")
-            try:
-                await done
-            finally:
-                audio_source.cleanup()
-    except Exception as exc:
+        recipient = await bot.fetch_user(recipient_id)
+        conversation_id = uuid.uuid4().hex[:10].upper()
+        outgoing = discord.Embed(
+            title="Anonymous message",
+            description=message.strip()[:1800],
+            color=discord.Color.dark_red())
+        outgoing.set_footer(text="Reply to this DM to respond anonymously")
+        await recipient.send(embed=outgoing)
+    except discord.Forbidden:
         await interaction.followup.send(
-            f"Could not process or play that audio: {type(exc).__name__}"
-        )
+            "I couldn't DM that user. They may have DMs disabled or may not share a server with me.",
+            ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.followup.send("Discord couldn't deliver that message. Try again later.", ephemeral=True)
+        return
+
+    timestamp = now()
+    with db() as con:
+        con.execute(
+            """INSERT INTO conversations
+               (id, owner_id, recipient_id, recipient_name, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'open', ?, ?)""",
+            (conversation_id, str(interaction.user.id), str(recipient_id), str(recipient), timestamp, timestamp))
+    add_message(conversation_id, "owner", message.strip())
+    conversation = get_conversation(conversation_id, interaction.user.id)
+    await interaction.followup.send(
+        content="**Anonymous message sent.** This dashboard is only visible to you.",
+        embed=dashboard_embed(conversation),
+        view=ConversationDashboard(interaction.user.id, conversation_id),
+        ephemeral=True)
 
 
-@bot.tree.command(name="stop", description="Stop vocal playback")
-async def stop(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if vc and vc.is_playing():
-        vc.stop()
-        await interaction.response.send_message("Stopped playback")
-    else:
-        await interaction.response.send_message("Nothing is playing", ephemeral=True)
+@bot.tree.command(name="inbox", description="View your anonymous conversations")
+async def inbox(interaction: discord.Interaction):
+    with db() as con:
+        conversations = con.execute(
+            "SELECT * FROM conversations WHERE owner_id=? ORDER BY updated_at DESC LIMIT 25",
+            (str(interaction.user.id),)).fetchall()
+
+    if not conversations:
+        await interaction.response.send_message(
+            "Your anonymous inbox is empty. Use /dm to start a conversation.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Anonymous User | Inbox",
+        description="Select a conversation to open its private dashboard.",
+        color=discord.Color.dark_red())
+    for row in conversations[:10]:
+        embed.add_field(
+            name="To " + row["recipient_name"] + " • " + row["status"].title(),
+            value="ID: " + row["id"] + " • Updated: " + row["updated_at"][:16],
+            inline=False)
+    embed.set_footer(text="Only you can see this inbox")
+    await interaction.response.send_message(
+        embed=embed, view=InboxView(interaction.user.id, conversations), ephemeral=True)
 
 
-@bot.tree.command(name="leave", description="Disconnect the bot from voice")
-async def leave(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if vc and vc.is_connected():
-        await vc.disconnect()
-        await interaction.response.send_message("Left the voice channel")
-    else:
-        await interaction.response.send_message("I am not in a voice channel", ephemeral=True)
+@bot.tree.command(name="dmclose", description="Close one of your anonymous conversations")
+@app_commands.describe(conversation_id="The ID shown in your conversation dashboard")
+async def dmclose(interaction: discord.Interaction, conversation_id: str):
+    conversation_id = conversation_id.strip().upper()
+    conversation = get_conversation(conversation_id, interaction.user.id)
+    if not conversation:
+        await interaction.response.send_message("Conversation not found in your inbox.", ephemeral=True)
+        return
+
+    with db() as con:
+        con.execute(
+            "UPDATE conversations SET status='closed', updated_at=? WHERE id=? AND owner_id=?",
+            (now(), conversation_id, str(interaction.user.id)))
+    updated = get_conversation(conversation_id, interaction.user.id)
+    await interaction.response.send_message(
+        "Conversation closed.", embed=dashboard_embed(updated), ephemeral=True)
 
 
 if not TOKEN:
     raise RuntimeError("Set the DISCORD_TOKEN environment variable")
 
+init_db()
 bot.run(TOKEN)
