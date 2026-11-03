@@ -136,6 +136,63 @@ def dashboard_embed(conversation):
     return embed
 
 
+class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
+    reply_text = discord.ui.TextInput(
+        label="Your reply",
+        placeholder="Write your anonymous reply...",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=1800,
+        required=True,
+    )
+
+    def __init__(self, owner_id, conversation_id):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.conversation_id = conversation_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        conversation = get_conversation(self.conversation_id, self.owner_id)
+        if not conversation or conversation["status"] != "open":
+            await interaction.response.send_message("This conversation is closed or no longer exists.", ephemeral=True)
+            return
+
+        content = str(self.reply_text.value).strip()
+        if not content:
+            await interaction.response.send_message("Your reply cannot be empty.", ephemeral=True)
+            return
+
+        try:
+            recipient = await bot.fetch_user(int(conversation["recipient_id"]))
+            outgoing = discord.Embed(
+                title="Anonymous reply",
+                description=content,
+                color=discord.Color.dark_red(),
+            )
+            outgoing.set_footer(text="Reply to this DM to respond anonymously")
+            await recipient.send(embed=outgoing)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I couldn't deliver your reply. The recipient may have DMs disabled.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message("Discord couldn't deliver your reply. Try again later.", ephemeral=True)
+            return
+
+        add_message(self.conversation_id, "owner", content)
+        updated = get_conversation(self.conversation_id, self.owner_id)
+        dashboard_message = LIVE_DASHBOARDS.get(self.conversation_id)
+        if dashboard_message:
+            try:
+                await dashboard_message.edit(embed=dashboard_embed(updated))
+            except (discord.NotFound, discord.HTTPException):
+                LIVE_DASHBOARDS.pop(self.conversation_id, None)
+
+        await interaction.response.send_message("Your anonymous reply was sent.", ephemeral=True)
+
+
 class ConversationDashboard(discord.ui.View):
     def __init__(self, owner_id, conversation_id):
         super().__init__(timeout=900)
@@ -147,6 +204,14 @@ class ConversationDashboard(discord.ui.View):
             await interaction.response.send_message("This dashboard belongs to someone else.", ephemeral=True)
             return False
         return True
+
+    @discord.ui.button(label="Reply", style=discord.ButtonStyle.success)
+    async def reply(self, interaction, button):
+        conversation = get_conversation(self.conversation_id, self.owner_id)
+        if not conversation or conversation["status"] != "open":
+            await interaction.response.send_message("This conversation is closed.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReplyModal(self.owner_id, self.conversation_id))
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
     async def refresh(self, interaction, button):
