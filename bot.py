@@ -347,7 +347,7 @@ async def on_message(message):
 @bot.tree.command(name="dm", description="Send an anonymous DM and open its dashboard")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(user_id="The recipient's Discord user ID", message="The anonymous message to send")
+@app_commands.describe(user_id="Your own ID to DM yourself, or another recipient's ID", message="The anonymous message to send")
 async def dm(interaction: discord.Interaction, user_id: str, message: str):
     cooldown_key = str(interaction.user.id)
     remaining = 30 - (time.time() - SEND_COOLDOWNS.get(cooldown_key, 0))
