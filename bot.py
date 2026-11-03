@@ -363,9 +363,6 @@ async def dm(interaction: discord.Interaction, user_id: str, message: str):
         await interaction.followup.send("Enter a valid Discord user ID.", ephemeral=True)
         return
 
-    if recipient_id == interaction.user.id:
-        await interaction.followup.send("You cannot message yourself.", ephemeral=True)
-        return
     if not message.strip():
         await interaction.followup.send("Your message cannot be empty.", ephemeral=True)
         return
